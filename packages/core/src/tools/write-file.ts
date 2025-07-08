@@ -23,7 +23,6 @@ import {
   ensureCorrectEdit,
   ensureCorrectFileContent,
 } from '../utils/editCorrector.js';
-import { GeminiClient } from '../core/client.js';
 import { DEFAULT_DIFF_OPTIONS } from './diffOptions.js';
 import { ModifiableTool, ModifyContext } from './modifiable-tool.js';
 import { getSpecificMimeType } from '../utils/fileUtils.js';
@@ -45,6 +44,11 @@ export interface WriteFileToolParams {
    * The content to write to the file
    */
   content: string;
+
+  /**
+   * Whether the proposed content was modified by the user.
+   */
+  modified_by_user?: boolean;
 }
 
 interface GetCorrectedFileContentResult {
@@ -62,13 +66,14 @@ export class WriteFileTool
   implements ModifiableTool<WriteFileToolParams>
 {
   static readonly Name: string = 'write_file';
-  private readonly client: GeminiClient;
 
   constructor(private readonly config: Config) {
     super(
       WriteFileTool.Name,
       'WriteFile',
-      'Writes content to a specified file in the local filesystem.',
+      `Writes content to a specified file in the local filesystem. 
+      
+      The user has the ability to modify \`content\`. If modified, this will be stated in the response.`,
       {
         properties: {
           file_path: {
@@ -85,10 +90,15 @@ export class WriteFileTool
         type: 'object',
       },
     );
-
-    this.client = this.config.getGeminiClient();
   }
 
+  /**
+   * Checks if a given path is within the root directory bounds.
+   * This security check prevents writing files outside the designated root directory.
+   *
+   * @param pathToCheck The absolute path to validate
+   * @returns True if the path is within the root directory, false otherwise
+   */
   private isWithinRoot(pathToCheck: string): boolean {
     const normalizedPath = path.normalize(pathToCheck);
     const normalizedRoot = path.normalize(this.config.getTargetDir());
@@ -270,9 +280,16 @@ export class WriteFileTool
         DEFAULT_DIFF_OPTIONS,
       );
 
-      const llmSuccessMessage = isNewFile
-        ? `Successfully created and wrote to new file: ${params.file_path}`
-        : `Successfully overwrote file: ${params.file_path}`;
+      const llmSuccessMessageParts = [
+        isNewFile
+          ? `Successfully created and wrote to new file: ${params.file_path}.`
+          : `Successfully overwrote file: ${params.file_path}.`,
+      ];
+      if (params.modified_by_user) {
+        llmSuccessMessageParts.push(
+          `User modified the \`content\` to be: ${params.content}`,
+        );
+      }
 
       const displayResult: FileDiff = { fileDiff, fileName };
 
@@ -298,7 +315,7 @@ export class WriteFileTool
       }
 
       return {
-        llmContent: llmSuccessMessage,
+        llmContent: llmSuccessMessageParts.join(' '),
         returnDisplay: displayResult,
       };
     } catch (error) {
@@ -346,13 +363,14 @@ export class WriteFileTool
     if (fileExists) {
       // This implies originalContent is available
       const { params: correctedParams } = await ensureCorrectEdit(
+        filePath,
         originalContent,
         {
           old_string: originalContent, // Treat entire current content as old_string
           new_string: proposedContent,
           file_path: filePath,
         },
-        this.client,
+        this.config.getGeminiClient(),
         abortSignal,
       );
       correctedContent = correctedParams.new_string;
@@ -360,7 +378,7 @@ export class WriteFileTool
       // This implies new file (ENOENT)
       correctedContent = await ensureCorrectFileContent(
         proposedContent,
-        this.client,
+        this.config.getGeminiClient(),
         abortSignal,
       );
     }
@@ -395,6 +413,7 @@ export class WriteFileTool
       ) => ({
         ...originalParams,
         content: modifiedProposedContent,
+        modified_by_user: true,
       }),
     };
   }
